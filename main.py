@@ -7,8 +7,6 @@ import time
 import threading
 import configparser
 from datetime import datetime
-import json
-import re
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -105,8 +103,6 @@ class ExcelToDBApp:
         save_config_button = ttk.Button(button_frame, text="Lưu cấu hình", command=self.save_current_config)
         save_config_button.grid(row=0, column=2, padx=(5, 5))
         
-        test_api_button = ttk.Button(button_frame, text="Test API", command=self.test_api_connection)
-        test_api_button.grid(row=0, column=3, padx=(5, 0))
         
         # Status
         status_frame = ttk.LabelFrame(main_frame, text="Trạng thái", padding="10")
@@ -148,79 +144,6 @@ class ExcelToDBApp:
         if folder:
             self.folder_path_var.set(folder)
     
-    def test_api_connection(self):
-        """Test kết nối API"""
-        def test_in_thread():
-            try:
-                api_url = self.api_url_var.get().rstrip('/')
-                api_key = self.api_key_var.get()
-                
-                headers = {
-                    'X-API-KEY': api_key,
-                    'Content-Type': 'application/json'
-                }
-                
-                self.log_message("🔍 Đang test kết nối API...")
-                self.log_message(f"URL: {api_url}")
-                
-                # Test 1: Kết nối cơ bản
-                try:
-                    response = requests.get(f"{api_url}/health", headers=headers, timeout=5)
-                    self.log_message(f"Health check: {response.status_code}")
-                except:
-                    self.log_message("⚠️ Endpoint /health không có, thử endpoints khác...")
-                
-                # Test 2: Kiểm tra endpoint models
-                try:
-                    response = requests.get(f"{api_url}/check_scan_models", headers=headers, timeout=5)
-                    self.log_message(f"GET /check_scan_models: {response.status_code}")
-                    if response.status_code != 200:
-                        self.log_message(f"Response: {response.text[:200]}")
-                except Exception as e:
-                    self.log_message(f"❌ Lỗi test models: {str(e)}")
-                
-                # Test 3: Kiểm tra endpoint tmp
-                test_data = {
-                    'barcode': 'TEST123',
-                    'result': 'TEST',
-                    'model': 'TEST',
-                    'file_name': 'test.xlsx',
-                    'datetime': '2025-10-04 12:00:00'
-                }
-                
-                try:
-                    response = requests.post(f"{api_url}/check_scans_tmp", headers=headers, json=test_data, timeout=5)
-                    self.log_message(f"POST /check_scans_tmp: {response.status_code}")
-                    if response.status_code not in [200, 201]:
-                        self.log_message(f"Response: {response.text[:200]}")
-                    else:
-                        self.log_message("✅ API connection OK!")
-                except Exception as e:
-                    self.log_message(f"❌ Lỗi test upload: {str(e)}")
-                
-                # Test 4: Kiểm tra các endpoint phổ biến khác
-                common_endpoints = [
-                    "/api/check_scans_tmp",
-                    "/check-scans-tmp", 
-                    "/scans/tmp",
-                    "/upload/barcode"
-                ]
-                
-                self.log_message("🔍 Kiểm tra các endpoint khác:")
-                for endpoint in common_endpoints:
-                    try:
-                        test_url = api_url.replace('/api', '') + endpoint
-                        response = requests.post(test_url, headers=headers, json=test_data, timeout=3)
-                        self.log_message(f"  {endpoint}: {response.status_code}")
-                    except:
-                        pass
-                        
-            except Exception as e:
-                self.log_message(f"❌ Lỗi test API: {str(e)}")
-        
-        # Chạy test trong thread riêng
-        thread = threading.Thread(target=test_in_thread, daemon=True)
-        thread.start()
     
     def save_current_config(self):
         """Lưu cấu hình hiện tại"""
@@ -504,9 +427,8 @@ class ExcelToDBApp:
         return (has_digit and has_alpha and len(cell_str) >= 8)
 
     def create_clean_excel_file(self, file_path):
-        """Tạo file Excel sạch chỉ chứa các dòng có barcode hợp lệ và định dạng giống số đông"""
-        import tempfile
-        import os
+        """Tạo file Excel sạch chỉ chứa các dòng có barcode hợp lệ và định dạng giống số đông (tối ưu hiệu năng, clean code)"""
+        import tempfile, os
         from collections import Counter
         filename = os.path.basename(file_path)
         temp_file = None
@@ -519,34 +441,25 @@ class ExcelToDBApp:
                 valid_rows = 0
                 for sheet_name in excel_file.sheet_names:
                     try:
-                        df = pd.read_excel(file_path, sheet_name=sheet_name, header=0, engine='openpyxl')
-                        df_clean = df.dropna(how='all')
-                        if len(df_clean) > 0:
-                            total_rows += len(df_clean)
-                            # Lọc các dòng có barcode hợp lệ
-                            valid_rows_list = []
-                            row_lengths = []
-                            for idx, row in df_clean.iterrows():
-                                has_valid_barcode = False
-                                for col_idx in range(min(8, len(row))):
-                                    if self.is_valid_barcode(row.iloc[col_idx]):
-                                        has_valid_barcode = True
-                                        break
-                                if has_valid_barcode:
-                                    valid_rows_list.append(row)
-                                    row_lengths.append(len(row.dropna()))
-                            # Chỉ giữ các dòng có số lượng cột giống số đông
-                            if valid_rows_list:
-                                # Tìm số lượng cột phổ biến nhất
-                                if row_lengths:
-                                    majority_len = Counter(row_lengths).most_common(1)[0][0]
-                                    filtered_rows = [row for row, rlen in zip(valid_rows_list, row_lengths) if len(row.dropna()) == majority_len]
-                                else:
-                                    filtered_rows = valid_rows_list
-                                if filtered_rows:
-                                    clean_df = pd.DataFrame(filtered_rows)
-                                    clean_df.to_excel(writer, sheet_name=sheet_name, index=False)
-                                    valid_rows += len(clean_df)
+                        df = pd.read_excel(file_path, sheet_name=sheet_name, header=0, engine='openpyxl').dropna(how='all')
+                        if df.empty:
+                            continue
+                        total_rows += len(df)
+                        # Xác định barcode hợp lệ và chiều dài dòng
+                        barcodes_mask = df.iloc[:, :8].applymap(self.is_valid_barcode)
+                        valid_mask = barcodes_mask.any(axis=1)
+                        valid_df = df[valid_mask].copy()
+                        if valid_df.empty:
+                            continue
+                        row_lengths = valid_df.apply(lambda x: x.dropna().shape[0], axis=1)
+                        if not row_lengths.empty:
+                            majority_len = row_lengths.mode().iloc[0]
+                            filtered_df = valid_df[row_lengths == majority_len]
+                        else:
+                            filtered_df = valid_df
+                        if not filtered_df.empty:
+                            filtered_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                            valid_rows += len(filtered_df)
                     except Exception as sheet_error:
                         self.log_message(f"❌ Lỗi đọc sheet '{sheet_name}': {str(sheet_error)}")
                         continue
