@@ -6,10 +6,9 @@ import os
 import time
 import threading
 import configparser
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 import re
-import unicodedata
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -504,332 +503,64 @@ class ExcelToDBApp:
         
         return (has_digit and has_alpha and len(cell_str) >= 8)
 
-    def normalize_column_name(self, column_name):
-        """Chuẩn hóa tên cột để dễ so khớp"""
-        if column_name is None:
-            return ''
-        column_str = self.remove_diacritics(str(column_name).strip().lower())
-        return re.sub(r'[^a-z0-9]', '', column_str)
-
-    def remove_diacritics(self, text):
-        """Loại bỏ dấu tiếng Việt hoặc ký tự có dấu"""
-        if not isinstance(text, str):
-            return text
-        normalized = unicodedata.normalize('NFD', text)
-        without_diacritics = ''.join(ch for ch in normalized if unicodedata.category(ch) != 'Mn')
-        return unicodedata.normalize('NFC', without_diacritics)
-
-    def normalize_result_value(self, value):
-        """Chuẩn hóa giá trị kết quả (PASS/FAIL) nếu có thể"""
-        if value is None:
-            return None
-
-        value_str = str(value).strip()
-        if value_str == '':
-            return None
-
-        normalized = self.remove_diacritics(value_str).lower().strip()
-        normalized = normalized.replace(' ', '').replace('_', '')
-
-        positive_keywords = {
-            'ok', 'pass', 'passed', 'good', 'success', 'qualified', '合格',
-            '良品', 'dat', 'đạt', 'đạt', 'completed', 'done', 'passok', 'okpass',
-            'pass1', 'pass2', 'pass3', 'pass4'
-        }
-        negative_keywords = {
-            'ng', 'ngok', 'fail', 'failed', 'error', 'ng1', 'ng2', 'ng3', 'ng4',
-            'notgood', 'reject', 'nok', 'nok1', 'nok2', '不良', '不合格',
-            'failng', 'fail1', 'fail2', 'fail3'
-        }
-
-        if normalized in positive_keywords or normalized.endswith('pass') or normalized.endswith('ok'):
-            return 'PASS'
-        if normalized in negative_keywords or normalized.endswith('ng') or normalized.endswith('fail'):
-            return 'FAIL'
-
-        return value_str
-
-    def parse_datetime_value(self, value):
-        """Cố gắng parse giá trị ngày giờ từ nhiều định dạng khác nhau"""
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            return None
-
-        if isinstance(value, datetime):
-            return value
-
-        if isinstance(value, (int, float)):
-            try:
-                # Excel serial number
-                base_date = datetime(1899, 12, 30)
-                return base_date + timedelta(days=float(value))
-            except Exception:
-                pass
-
-        if isinstance(value, str):
-            value = value.strip()
-            if value == '':
-                return None
-
-        try:
-            parsed = pd.to_datetime(value, errors='coerce')
-            if pd.isna(parsed):
-                parsed = pd.to_datetime(value, errors='coerce', dayfirst=True)
-            if pd.isna(parsed):
-                return None
-            if isinstance(parsed, pd.Timestamp):
-                if parsed.tzinfo is not None:
-                    parsed = parsed.tz_convert(None)
-                return parsed.to_pydatetime()
-            return parsed
-        except Exception:
-            return None
-
-    def extract_datetime_from_filename(self, filename):
-        """Cố gắng lấy ngày giờ từ tên file nếu có"""
-        base_name = os.path.splitext(filename)[0]
-        base_name = base_name.replace(' ', '_')
-
-        # Pattern: YYYYMMDDHHMMSS hoặc YYYY-MM-DD_HHMMSS
-        match = re.search(r'(20\d{2}|19\d{2})[-_]?(\d{2})[-_]?(\d{2})[T\s_-]?(\d{2})(\d{2})(\d{2})', base_name)
-        if match:
-            year, month, day, hour, minute, second = map(int, match.groups())
-            try:
-                return datetime(year, month, day, hour, minute, second)
-            except ValueError:
-                pass
-
-        # Pattern: YYYYMMDD hoặc YYYY-MM-DD, không có giờ
-        match = re.search(r'(20\d{2}|19\d{2})[-_]?(\d{2})[-_]?(\d{2})', base_name)
-        if match:
-            year, month, day = map(int, match.groups())
-            try:
-                return datetime(year, month, day, 0, 0, 0)
-            except ValueError:
-                pass
-
-        return None
-
-    def _find_barcode_in_row(self, row, barcode_columns):
-        """Tìm barcode hợp lệ trong một dòng dữ liệu"""
-        for col in barcode_columns:
-            if col in row.index and self.is_valid_barcode(row[col]):
-                return str(row[col]).strip()
-
-        for value in row:
-            if self.is_valid_barcode(value):
-                return str(value).strip()
-        return None
-
-    def _find_result_in_row(self, row, result_columns):
-        """Tìm kết quả PASS/FAIL trong một dòng"""
-        for col in result_columns:
-            if col in row.index:
-                normalized = self.normalize_result_value(row[col])
-                if normalized:
-                    return normalized
-
-        for value in row:
-            normalized = self.normalize_result_value(value)
-            if normalized:
-                return normalized
-        return None
-
-    def _find_datetime_in_row(self, row, datetime_columns, date_columns=None, time_columns=None):
-        """Tìm thời gian scan trong một dòng"""
-        for col in datetime_columns:
-            if col in row.index:
-                parsed = self.parse_datetime_value(row[col])
-                if parsed:
-                    return parsed
-
-        for value in row:
-            parsed = self.parse_datetime_value(value)
-            if parsed:
-                return parsed
-
-        date_component = None
-        time_component = None
-
-        if date_columns:
-            for col in date_columns:
-                if col in row.index:
-                    parsed = self.parse_datetime_value(row[col])
-                    if parsed:
-                        date_component = parsed
-                        break
-
-        if time_columns:
-            for col in time_columns:
-                if col in row.index:
-                    parsed = self.parse_datetime_value(row[col])
-                    if parsed:
-                        time_component = parsed
-                        break
-
-        if date_component and time_component:
-            try:
-                return datetime.combine(date_component.date(), time_component.time())
-            except Exception:
-                pass
-
-        if date_component:
-            return date_component
-
-        if time_component:
-            try:
-                today = datetime.now().date()
-                return datetime.combine(today, time_component.time())
-            except Exception:
-                pass
-
-        return None
-
-    def extract_standard_rows(self, df, sheet_name, model, filename):
-        """Trích xuất dữ liệu chuẩn hóa từ DataFrame"""
-        normalized_headers = {
-            col: self.normalize_column_name(col) for col in df.columns
-        }
-
-        barcode_keywords = ['barcode', 'qrcode', 'serial', 'sn', 'macode', 'mavach', 'code', 'sncode', 'imei']
-        result_keywords = ['result', 'ketqua', '判定', 'status', 'state', 'kq', '判断', 'kiemtra', 'testresult', 'judgement', 'judgment', 'phanloai']
-        datetime_keywords = [
-            'time', 'datetime', 'timestamp', 'thoigiantest', 'thoigiankiemtra',
-            'thoigianquet', 'thoigiancheck', 'testtime', 'starttime', 'endtime',
-            'finishtime', 'scantime', 'scan', '检测时间', '測試時間', '时间'
-        ]
-        date_keywords = [
-            'date', 'ngay', 'ngaygio', 'recorddate', 'docudate', 'calibrationdate',
-            'datime', '日期', '日付', 'day'
-        ]
-        time_keywords = [
-            'time', 'gio', 'giophut', 'giay', 'scantime', 'thoigian', 'testtime',
-            'timing', 'recordtime', '検査時刻', '時刻', 'hour', 'minute', 'second'
-        ]
-
-        barcode_columns = [col for col, norm in normalized_headers.items()
-                           if any(keyword in norm for keyword in barcode_keywords)]
-        result_columns = [col for col, norm in normalized_headers.items()
-                          if any(keyword in norm for keyword in result_keywords)]
-        datetime_columns = [col for col, norm in normalized_headers.items()
-                            if any(keyword in norm for keyword in datetime_keywords)]
-        date_columns = [col for col, norm in normalized_headers.items()
-                        if any(keyword in norm for keyword in date_keywords)]
-        time_columns = [col for col, norm in normalized_headers.items()
-                        if any(keyword in norm for keyword in time_keywords)]
-
-        if not datetime_columns and not (date_columns and time_columns):
-            self.log_message(
-                f"⚠️ Sheet '{sheet_name}' không tìm thấy cột thời gian. Tiêu đề: {', '.join(map(str, df.columns.tolist()))}"
-            )
-
-        cleaned_rows = []
-        missing_datetime_logs = 0
-        fallback_logged = False
-
-        for idx, row in df.iterrows():
-            barcode_value = self._find_barcode_in_row(row, barcode_columns)
-            if not barcode_value:
-                continue
-
-            result_value = self._find_result_in_row(row, result_columns)
-            scan_time = self._find_datetime_in_row(row, datetime_columns, date_columns, time_columns)
-
-            # Nếu không tìm thấy thời gian, thử lấy từ tên file
-            if scan_time is None:
-                fallback_time = self.extract_datetime_from_filename(filename)
-                if fallback_time:
-                    scan_time = fallback_time
-                    if not fallback_logged:
-                        self.log_message(
-                            f"ℹ️ Sheet '{sheet_name}': sử dụng thời gian từ tên file {fallback_time.strftime('%Y-%m-%d %H:%M:%S')}"
-                        )
-                        fallback_logged = True
-
-            if scan_time is None and missing_datetime_logs < 3:
-                self.log_message(
-                    f"⚠️ Sheet '{sheet_name}', dòng {idx}: không tìm thấy thời gian. Giá trị mẫu: {', '.join(str(row[col]) for col in df.columns[:5])}"
-                )
-                missing_datetime_logs += 1
-
-            if isinstance(idx, (int, float)):
-                row_number = int(idx) + 2  # +2 vì pandas index bắt đầu tử 0 và dòng tiêu đề
-            else:
-                row_number = idx
-
-            cleaned_rows.append({
-                'barcode': barcode_value,
-                'result': result_value or '',
-                'model': model or '',
-                'file_name': filename,
-                'sheet_name': sheet_name,
-                'row_number': row_number,
-                'datetime': scan_time.strftime('%Y-%m-%d %H:%M:%S') if scan_time else ''
-            })
-
-        return cleaned_rows
-
-    def create_clean_excel_file(self, file_path, model=None):
-        """Tạo file Excel chuẩn chỉ chứa các dòng hợp lệ"""
+    def create_clean_excel_file(self, file_path):
+        """Tạo file Excel sạch chỉ chứa các dòng có barcode hợp lệ và định dạng giống số đông"""
         import tempfile
         import os
-
+        from collections import Counter
         filename = os.path.basename(file_path)
-        temp_file_path = None
-
+        temp_file = None
         try:
             excel_file = pd.ExcelFile(file_path)
-
-            fd, temp_file_path = tempfile.mkstemp(prefix='filtered_', suffix='.xlsx')
-            os.close(fd)
-
-            total_rows = 0
-            valid_rows = 0
-
-            with pd.ExcelWriter(temp_file_path, engine='openpyxl') as writer:
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+            temp_file.close()
+            with pd.ExcelWriter(temp_file.name, engine='openpyxl') as writer:
+                total_rows = 0
+                valid_rows = 0
                 for sheet_name in excel_file.sheet_names:
                     try:
                         df = pd.read_excel(file_path, sheet_name=sheet_name, header=0, engine='openpyxl')
                         df_clean = df.dropna(how='all')
-
-                        if len(df_clean) == 0:
-                            continue
-
-                        total_rows += len(df_clean)
-                        standardized_rows = self.extract_standard_rows(df_clean, sheet_name, model, filename)
-
-                        if standardized_rows:
-                            clean_df = pd.DataFrame(standardized_rows)
-                            clean_df.drop_duplicates(subset=['barcode', 'sheet_name', 'row_number'], inplace=True)
-                            ordered_columns = [
-                                'barcode', 'result', 'model', 'file_name',
-                                'sheet_name', 'row_number', 'datetime'
-                            ]
-                            for col in ordered_columns:
-                                if col not in clean_df.columns:
-                                    clean_df[col] = ''
-                            clean_df = clean_df[ordered_columns]
-                            clean_df.to_excel(writer, sheet_name=sheet_name, index=False)
-                            valid_rows += len(clean_df)
+                        if len(df_clean) > 0:
+                            total_rows += len(df_clean)
+                            # Lọc các dòng có barcode hợp lệ
+                            valid_rows_list = []
+                            row_lengths = []
+                            for idx, row in df_clean.iterrows():
+                                has_valid_barcode = False
+                                for col_idx in range(min(8, len(row))):
+                                    if self.is_valid_barcode(row.iloc[col_idx]):
+                                        has_valid_barcode = True
+                                        break
+                                if has_valid_barcode:
+                                    valid_rows_list.append(row)
+                                    row_lengths.append(len(row.dropna()))
+                            # Chỉ giữ các dòng có số lượng cột giống số đông
+                            if valid_rows_list:
+                                # Tìm số lượng cột phổ biến nhất
+                                if row_lengths:
+                                    majority_len = Counter(row_lengths).most_common(1)[0][0]
+                                    filtered_rows = [row for row, rlen in zip(valid_rows_list, row_lengths) if len(row.dropna()) == majority_len]
+                                else:
+                                    filtered_rows = valid_rows_list
+                                if filtered_rows:
+                                    clean_df = pd.DataFrame(filtered_rows)
+                                    clean_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                                    valid_rows += len(clean_df)
                     except Exception as sheet_error:
                         self.log_message(f"❌ Lỗi đọc sheet '{sheet_name}': {str(sheet_error)}")
                         continue
-
-            if valid_rows == 0:
-                self.log_message(f"⚠️ {filename} không có dòng barcode hợp lệ nào")
-                if temp_file_path and os.path.exists(temp_file_path):
-                    os.unlink(temp_file_path)
-                return None, 0, total_rows
-
-            self.log_message(
-                f"📊 {filename}: {valid_rows}/{total_rows} dòng dữ liệu chuẩn sẽ được upload"
-            )
-            self.log_message(f"📁 File chuẩn tạm: {temp_file_path}")
-            return temp_file_path, valid_rows, total_rows
-
+                if valid_rows == 0:
+                    self.log_message(f"⚠️ {filename} không có dòng barcode hợp lệ nào")
+                    if os.path.exists(temp_file.name):
+                        os.unlink(temp_file.name)
+                    return None, 0, 0
+                self.log_message(f"📊 {filename}: {valid_rows}/{total_rows} dòng hợp lệ sẽ được upload")
+                return temp_file.name, valid_rows, total_rows
         except Exception as e:
             self.log_message(f"❌ Lỗi tạo file sạch cho {filename}: {str(e)}")
-            if temp_file_path and os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
+            if temp_file and os.path.exists(temp_file.name):
+                os.unlink(temp_file.name)
             return None, 0, 0
 
     def process_excel_file(self, file_path):
@@ -838,20 +569,18 @@ class ExcelToDBApp:
         temp_file = None
         
         try:
+            # Tạo file Excel sạch
+            temp_file, valid_rows, total_rows = self.create_clean_excel_file(file_path)
+            
+            if temp_file is None or valid_rows == 0:
+                self.total_errors += 1
+                return False
+            
             # Lấy model từ tên file
             extracted_model = self.extract_model_from_filename(filename)
             model = self.get_model_from_database(extracted_model)
             if model is None or str(model).strip() == '':
-                model = extracted_model if extracted_model else 'NULL'
-
-            self.log_message(f"🧾 Model sử dụng: {model}")
-
-            # Tạo file Excel sạch
-            temp_file, valid_rows, total_rows = self.create_clean_excel_file(file_path, model)
-
-            if temp_file is None or valid_rows == 0:
-                self.total_errors += 1
-                return False
+                model = 'NULL'
             
             api_url = self.api_url_var.get().rstrip('/')
             api_key = self.api_key_var.get()
@@ -876,8 +605,6 @@ class ExcelToDBApp:
                     if response.status_code in [200, 201]:
                         self.log_message(f"✅ {filename} ({model}) - Upload {valid_rows} dòng thành công")
                         self.total_files_processed += 1
-                        self.total_barcodes_uploaded += valid_rows
-                        self.update_stats()
                         return True
                         
                     elif response.status_code == 500:
