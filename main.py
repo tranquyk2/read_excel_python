@@ -315,13 +315,51 @@ class ExcelToDBApp:
                 self.log_message(f"Lỗi monitoring: {str(e)}")
     
     def process_existing_files(self):
-        """Xử lý các file Excel có sẵn trong thư mục"""
+        """Xử lý các file Excel có sẵn trong thư mục, chỉ lấy file trong 10 ngày gần nhất"""
         folder_path = self.folder_path_var.get()
+        current_time = time.time()
+        ten_days_ago = current_time - (10 * 24 * 60 * 60)  # 10 ngày trước
         
+        # Lọc file Excel trong 10 ngày gần nhất
+        excel_files = []
         for filename in os.listdir(folder_path):
             if filename.endswith('.xlsx') or filename.endswith('.xls'):
                 file_path = os.path.join(folder_path, filename)
+                try:
+                    file_mod_time = os.path.getmtime(file_path)
+                    if file_mod_time >= ten_days_ago:
+                        excel_files.append(filename)
+                except:
+                    # Nếu không đọc được thời gian file, vẫn thêm vào danh sách
+                    excel_files.append(filename)
+        
+        total_files = len(excel_files)
+        if total_files == 0:
+            self.log_message("📂 Không có file Excel nào trong 10 ngày gần nhất")
+            return
+            
+        self.log_message(f"📂 Tìm thấy {total_files} file Excel trong 10 ngày gần nhất")
+        
+        for i, filename in enumerate(excel_files, 1):
+            file_path = os.path.join(folder_path, filename)
+            
+            # Kiểm tra file có đang được mở hay không
+            try:
+                with open(file_path, 'rb') as f:
+                    pass
                 self.process_excel_file(file_path)
+                # Tăng delay lên 5 giây giữa các file để tránh nghẽn server
+                time.sleep(5)
+            except PermissionError:
+                self.log_message(f"⚠️ {filename} - đang được mở, bỏ qua")
+                self.total_errors += 1
+            except Exception as e:
+                self.log_message(f"❌ {filename} - Lỗi: {str(e)}")
+                self.total_errors += 1
+                # Bỏ qua file lỗi và tiếp tục
+                continue
+            
+            self.update_stats()
     
     def check_for_modified_files(self):
         """Kiểm tra file đã thay đổi"""
@@ -342,13 +380,13 @@ class ExcelToDBApp:
                         self.processed_files[file_path] = mod_time
     
     def extract_model_from_filename(self, filename):
-        """Trích xuất model từ tên file: lấy phần giữa prefix và ngày tháng, ví dụ IPS-EP150WN-24V-CV_2025-09-25.xlsx => EP150WN-24V-CV"""
+        """Trích xuất model từ tên file: loại bỏ phần ngày tháng ở cuối, ví dụ TPRF 40W 36V 5PCB2025-12-03.xlsx => TPRF 40W 36V 5PCB"""
+        import re
         base_name = os.path.splitext(filename)[0]
-        # Tìm phần model giữa prefix và ngày tháng
-        # Tách theo dấu gạch dưới, lấy phần đầu tiên (trước ngày tháng)
-        parts = base_name.split('_')
-        if len(parts) > 1:
-            model_part = parts[0]
+        # Loại bỏ phần ngày tháng ở cuối (yyyy-mm-dd hoặc yyyy-mm-d)
+        model_match = re.match(r'(.+?)(\d{4}-\d{2}-\d{2}|\d{4}-\d{2}-\d{1})$', base_name)
+        if model_match:
+            model_part = model_match.group(1)
         else:
             model_part = base_name
         # Nếu có prefix IPS- thì loại bỏ
@@ -357,7 +395,7 @@ class ExcelToDBApp:
         return model_part.strip()
     
     def get_model_from_database(self, extracted_model):
-        """So sánh toàn chuỗi tên file với barcode/code, lấy model giống nhất (best match)"""
+        """So sánh toàn chuỗi tên file với code, luôn trả về code (tên model) khi khớp"""
         import difflib
         try:
             api_url = self.api_url_var.get().rstrip('/')
@@ -373,15 +411,12 @@ class ExcelToDBApp:
                 if isinstance(models, dict) and 'data' in models and 'models' in models['data']:
                     models = models['data']['models']
                 extracted_model_norm = extracted_model.strip().lower().replace(' ', '').replace('_','').replace('-','')
-                # Tạo danh sách tất cả barcode/code đã chuẩn hóa
+                # Tạo danh sách tất cả code đã chuẩn hóa
                 model_map = []
                 for model in models:
-                    barcode = str(model.get('barcode', '')).strip().lower().replace(' ', '').replace('_','').replace('-','')
                     code = str(model.get('code', '')).strip().lower().replace(' ', '').replace('_','').replace('-','')
-                    if barcode:
-                        model_map.append((model.get('barcode'), barcode))
                     if code:
-                        model_map.append((model.get('barcode') or model.get('code'), code))
+                        model_map.append((model.get('code'), code))
                 # Tìm best match bằng difflib
                 if model_map:
                     best = difflib.get_close_matches(extracted_model_norm, [m[1] for m in model_map], n=1, cutoff=0.6)
@@ -391,77 +426,141 @@ class ExcelToDBApp:
                                 return name
                 return None
             else:
-                self.log_message(f"Không thể lấy danh sách models: {response.status_code}")
                 return None
         except Exception as e:
-            self.log_message(f"Lỗi khi lấy model từ database: {str(e)}")
             return None
     
     def process_excel_file(self, file_path):
-        """Chỉ upload file Excel lên API, lấy model đối chiếu tên file và đếm số barcode"""
+        """Chỉ upload file Excel lên API, lấy model đối chiếu tên file"""
+        filename = os.path.basename(file_path)
         try:
-            filename = os.path.basename(file_path)
-            self.log_message(f"📁 Đang upload file: {filename}")
-            # Đếm số barcode trong file Excel
-            barcode_count = 0
+            # Kiểm tra file có thể đọc được không (không hiển thị log chi tiết)
             try:
-                df = pd.read_excel(file_path)
-                # Tìm cột barcode (ưu tiên tên 'barcode', nếu không lấy cột đầu tiên)
-                barcode_col = None
-                for col in df.columns:
-                    if str(col).strip().lower() == 'barcode':
-                        barcode_col = col
-                        break
-                if barcode_col is None:
-                    barcode_col = df.columns[0]
-                barcode_count = df[barcode_col].dropna().shape[0]
-                # Kiểm tra cột 测试结果 (Test Result) nếu có
-                test_result_col = None
-                for col in df.columns:
-                    if str(col).strip() in ['测试结果', 'Test Result']:
-                        test_result_col = col
-                        break
-                if test_result_col:
-                    pass_count = df[df[test_result_col].isin(['PASS'])].shape[0]
-                    fail_count = df[df[test_result_col].isin(['FAIL', 'NG'])].shape[0]
-                    self.log_message(f"📊 Số PASS: {pass_count}, Số FAIL/NG: {fail_count}")
-            except Exception as e:
-                self.log_message(f"⚠️ Không đọc được số barcode: {str(e)}")
+                excel_file = pd.ExcelFile(file_path)
+                sheet_names = excel_file.sheet_names
+                
+                total_rows = 0
+                valid_sheets = []
+                
+                for sheet_name in sheet_names:
+                    try:
+                        # Đọc với error handling cho từng sheet
+                        df = pd.read_excel(file_path, sheet_name=sheet_name, engine='openpyxl')
+                        
+                        # Loại bỏ dòng trống hoàn toàn
+                        df_clean = df.dropna(how='all')
+                        
+                        # Loại bỏ dòng có lỗi format (dòng có quá nhiều cột trống hoặc merge cells)
+                        if len(df_clean.columns) > 0:
+                            # Loại bỏ dòng có tất cả các cột quan trọng đều NaN hoặc lỗi
+                            df_valid = df_clean.dropna(thresh=3)  # Giữ dòng có ít nhất 3 cột có dữ liệu
+                            
+                            sheet_rows = len(df_valid)
+                            if sheet_rows > 0:
+                                total_rows += sheet_rows
+                                valid_sheets.append(sheet_name)
+                                
+                    except Exception as sheet_error:
+                        # Nếu sheet bị lỗi hoàn toàn, thử đọc với skiprows
+                        try:
+                            df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=1, engine='openpyxl')
+                            df_clean = df.dropna(how='all')
+                            df_valid = df_clean.dropna(thresh=2)
+                            sheet_rows = len(df_valid)
+                            if sheet_rows > 0:
+                                total_rows += sheet_rows
+                                valid_sheets.append(sheet_name)
+                        except:
+                            # Sheet hoàn toàn không đọc được, bỏ qua
+                            continue
+                
+                if total_rows < 2:
+                    self.log_message(f"⚠️ File {filename} có quá ít dữ liệu hợp lệ ({total_rows} dòng), bỏ qua")
+                    return False
+                    
+            except Exception as read_error:
+                self.log_message(f"❌ Không đọc được file {filename}")
+                self.total_errors += 1
+                return False
+            
             # Lấy model từ tên file đối chiếu bảng model
             extracted_model = self.extract_model_from_filename(filename)
             model = self.get_model_from_database(extracted_model)
             if model is None or str(model).strip() == '':
                 model = 'NULL'
-                self.log_message(f"⚠️ Không tìm thấy model khớp với tên file: {extracted_model}. Ghi vào model NULL!")
-            else:
-                self.log_message(f"🔑 Model khớp: {model}")
+            
             api_url = self.api_url_var.get().rstrip('/')
             api_key = self.api_key_var.get()
             headers = {
                 'X-API-Key': api_key
             }
-            files = {
-                'scans[0][file]': (filename, open(file_path, 'rb'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-            }
-            data = {}
-            data['scans[0][model]'] = model
+            
+            # Upload file với retry
             try:
-                response = requests.post(f"{api_url}/check-scan/upload-file", headers=headers, files=files, data=data, timeout=30)
-                if response.status_code in [200, 201]:
-                    self.log_message("✅ Upload file thành công. Dữ liệu sẽ được xử lý tự động trên server.")
-                    self.total_files_processed += 1
-                    self.total_barcodes_uploaded += barcode_count
-                else:
-                    self.log_message(f"❌ Upload file thất bại: {response.status_code} - {response.text}")
-                    self.total_errors += 1
+                max_retries = 3
+                retry_delay = 5
+                
+                for attempt in range(max_retries):
+                    try:
+                        with open(file_path, 'rb') as file_handle:
+                            files = {
+                                'scans[0][file]': (filename, file_handle, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                            }
+                            data = {
+                                'scans[0][model]': model
+                            }
+                            
+                            response = requests.post(f"{api_url}/check-scan/upload-file", headers=headers, files=files, data=data, timeout=60)
+                        
+                        if response.status_code in [200, 201]:
+                            self.log_message(f"✅ {filename} ({model}) - Upload thành công")
+                            self.total_files_processed += 1
+                            break
+                            
+                        elif response.status_code == 500:
+                            if attempt < max_retries - 1:
+                                time.sleep(retry_delay)
+                                continue
+                            else:
+                                self.log_message(f"❌ {filename} ({model}) - Server lỗi (500)")
+                                self.total_errors += 1
+                                break
+                                
+                        elif response.status_code == 422:
+                            self.log_message(f"❌ {filename} ({model}) - Lỗi format file (422)")
+                            self.total_errors += 1
+                            break
+                            
+                        else:
+                            self.log_message(f"❌ {filename} ({model}) - Lỗi upload ({response.status_code})")
+                            self.total_errors += 1
+                            break
+                            
+                    except requests.exceptions.Timeout:
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            self.log_message(f"❌ {filename} ({model}) - Timeout")
+                            self.total_errors += 1
+                            break
+                            
+                    except requests.exceptions.ConnectionError:
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            self.log_message(f"❌ {filename} ({model}) - Lỗi kết nối")
+                            self.total_errors += 1
+                            break
+                            
             except Exception as e:
-                self.log_message(f"❌ Lỗi upload file: {str(e)}")
+                self.log_message(f"❌ {filename} ({model}) - Lỗi: {str(e)}")
                 self.total_errors += 1
-            self.update_stats()
+                
         except Exception as e:
-            self.log_message(f"❌ Lỗi upload database: {str(e)}")
+            self.log_message(f"❌ {filename} - Lỗi xử lý: {str(e)}")
             self.total_errors += 1
-            self.update_stats()
         return False
     
     def process_tmp_to_main_table(self):
@@ -517,6 +616,13 @@ class ExcelFileHandler(FileSystemEventHandler):
 
 def main():
     root = tk.Tk()
+    import os
+    icon_path = os.path.join(os.path.dirname(__file__), 'readexcel.ico')
+    if os.path.exists(icon_path):
+        try:
+            root.iconbitmap(icon_path)
+        except Exception:
+            pass
     app = ExcelToDBApp(root)
     root.mainloop()
 
